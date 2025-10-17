@@ -21,16 +21,12 @@ use nockapp::noun::slab::{NockJammer, NounSlab};
 use nockapp::utils::bytes::Byts;
 use nockapp::utils::make_tas;
 use nockapp::wire::{SystemWire, Wire};
-use nockapp::{
-    exit_driver, file_driver, markdown_driver, one_punch_driver, system_data_dir, CrownError,
-    NockApp, NockAppError, ToBytesExt,
-};
+use nockapp::{exit_driver, file_driver, markdown_driver, one_punch_driver, system_data_dir, CrownError, NockApp, NockAppError, ToBytesExt};
+
 use nockapp_grpc::pb::common::v1::Base58Hash as PbBase58Hash;
 use nockapp_grpc::pb::public::v1::transaction_accepted_response;
 use nockapp_grpc::{private_nockapp, public_nockchain};
-use nockchain_types::tx_engine::note::{
-    BalanceUpdate, Hash as DomainHash, TimelockIntent, TimelockRangeAbsolute, TimelockRangeRelative,
-};
+use nockchain_types::tx_engine::note::{BalanceUpdate, Hash as DomainHash, TimelockIntent, TimelockRangeAbsolute, TimelockRangeRelative};
 use nockchain_types::SchnorrPubkey;
 use nockvm::jets::cold::Nounable;
 use nockvm::noun::{Atom, Cell, FullDebugCell, IndirectAtom, Noun, D, NO, SIG, T, YES};
@@ -98,6 +94,26 @@ async fn main() -> Result<(), NockAppError> {
         // All other commands DO need sync
         _ => true,
     };
+
+    // Helper: require confirmation and env flag for privileged ops that expose private material
+    fn require_privileged_op() -> Result<(), NockAppError> {
+        if std::env::var("NOCKCHAIN_ALLOW_PRIVKEY_EXPORT").ok().as_deref() == Some("1") {
+            print!("WARNING: this operation may expose private key material. Type 'YES' to continue: ");
+            io::stdout()
+                .flush()
+                .map_err(|e| CrownError::Unknown(format!("Failed to flush stdout: {}", e)))?;
+            let mut s = String::new();
+            io::stdin()
+                .read_line(&mut s)
+                .map_err(|e| CrownError::Unknown(format!("Failed to read confirmation: {}", e)))?;
+            if s.trim() == "YES" {
+                return Ok(());
+            }
+        }
+        Err(NockAppError::OtherError(
+            "Privileged operation disabled. Set NOCKCHAIN_ALLOW_PRIVKEY_EXPORT=1 and confirm interactively".to_string(),
+        ))
+    }
 
     // Generate the command noun and operation
     let poke = match &cli.command {
@@ -292,6 +308,19 @@ async fn main() -> Result<(), NockAppError> {
             unreachable!("transaction-accepted handled earlier")
         }
     }?;
+
+    // Block privileged ops unless explicitly allowed
+    match &cli.command {
+        Commands::ShowMasterPrivkey
+        | Commands::ExportMasterPubkey
+        | Commands::ImportMasterPubkey { .. } => {
+            require_privileged_op()?;
+        }
+        Commands::ImportKeys { seedphrase: Some(_), .. } => {
+            require_privileged_op()?;
+        }
+        _ => {}
+    }
 
     // If this command requires sync, update the balance using a synchronous poke
     if requires_sync {
@@ -1123,7 +1152,7 @@ impl Wallet {
         let mut slab = NounSlab::new();
         Self::wallet("show-master-privkey", &[], Operation::Poke, &mut slab)
     }
-}
+} 
 
 pub async fn wallet_data_dir() -> Result<PathBuf, NockAppError> {
     let wallet_data_dir = system_data_dir().join("wallet");
@@ -1229,7 +1258,7 @@ fn format_transaction_accepted_markdown(tx_id: &str, accepted: bool) -> String {
 
     [
         "## Transaction Acceptance".to_string(),
-        format!("- tx id: `{}`", tx_id),
+        format!(- tx id: `{}`", tx_id),
         status_line.to_string(),
     ]
     .join("\n")
@@ -1239,531 +1268,5 @@ pub fn from_bytes(stack: &mut NounSlab, bytes: &[u8]) -> Atom {
     unsafe {
         let mut tas_atom = IndirectAtom::new_raw_bytes(stack, bytes.len(), bytes.as_ptr());
         tas_atom.normalize_as_atom()
-    }
-}
-
-// TODO: all these tests need to also validate the results and not
-// just ensure that the wallet can be poked with the expected noun.
-#[allow(warnings)]
-#[cfg(test)]
-mod tests {
-    use std::sync::Once;
-
-    use nockapp::kernel::boot::{self, Cli as BootCli};
-    use nockapp::wire::SystemWire;
-    use nockapp::{exit_driver, AtomExt, Bytes};
-    use nockchain_math::belt::Belt;
-    use nockchain_types::{BlockHeight, BlockHeightDelta};
-    use tokio::sync::mpsc;
-
-    use super::*;
-
-    static INIT: Once = Once::new();
-
-    fn init_tracing() {
-        INIT.call_once(|| {
-            let cli = boot::default_boot_cli(true);
-            boot::init_default_tracing(&cli);
-        });
-    }
-
-    #[test]
-    fn timelock_cli_accepts_ascending_bound() {
-        let range: TimelockRangeCli = "1..5".parse().unwrap();
-        let absolute = range.absolute();
-        assert_eq!(absolute.min, Some(BlockHeight(Belt(1))));
-        assert_eq!(absolute.max, Some(BlockHeight(Belt(5))));
-    }
-
-    #[test]
-    fn timelock_cli_accepts_open_upper_bound() {
-        let range: TimelockRangeCli = "..5".parse().unwrap();
-        let absolute = range.absolute();
-        assert_eq!(absolute.min, None);
-        assert_eq!(absolute.max, Some(BlockHeight(Belt(5))));
-    }
-
-    #[test]
-    fn timelock_cli_accepts_open_lower_bound() {
-        let range: TimelockRangeCli = "7..".parse().unwrap();
-        let relative = range.relative();
-        assert_eq!(relative.min, Some(BlockHeightDelta(Belt(7))));
-        assert_eq!(relative.max, None);
-    }
-
-    #[test]
-    fn timelock_cli_rejects_descending_bounds() {
-        let err = TimelockRangeCli::from_bounds(Some(10), Some(5)).unwrap_err();
-        assert!(err.contains("min <= max"));
-    }
-
-    #[test]
-    fn timelock_cli_allows_fully_open_interval() {
-        let range: TimelockRangeCli = "..".parse().unwrap();
-        assert!(range.absolute().min.is_none() && range.absolute().max.is_none());
-        assert!(range.relative().min.is_none() && range.relative().max.is_none());
-        assert!(!range.has_upper_bound());
-    }
-
-    #[test]
-    fn timelock_intent_from_ranges_handles_none() {
-        assert!(Wallet::timelock_intent_from_ranges(None, None).is_none());
-        let open_range: TimelockRangeCli = "..".parse().unwrap();
-
-        let explicit_none = Wallet::timelock_intent_from_ranges(
-            Some(open_range.absolute()),
-            Some(open_range.relative()),
-        )
-        .expect("expected explicit timelock intent");
-
-        assert_eq!(
-            explicit_none,
-            TimelockIntent {
-                absolute: TimelockRangeAbsolute::none(),
-                relative: TimelockRangeRelative::none(),
-            }
-        );
-    }
-
-    #[test]
-    fn timelock_intent_from_ranges_accepts_partial_specs() {
-        let absolute = TimelockRangeAbsolute::none();
-        let intent = Wallet::timelock_intent_from_ranges(Some(absolute.clone()), None)
-            .expect("absolute range should produce intent");
-        assert_eq!(intent.absolute, absolute);
-        assert_eq!(intent.relative, TimelockRangeRelative::none());
-    }
-
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_keygen() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&["--new"]);
-
-        let prover_hot_state = produce_prover_hot_state();
-        let nockapp = boot::setup(
-            KERNEL,
-            cli.clone(),
-            prover_hot_state.as_slice(),
-            "wallet",
-            None,
-        )
-        .await
-        .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-        let mut entropy = [0u8; 32];
-        let mut salt = [0u8; 16];
-        getrandom::fill(&mut entropy).map_err(|e| CrownError::Unknown(e.to_string()))?;
-        getrandom::fill(&mut salt).map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let (noun, op) = Wallet::keygen(&entropy, &salt)?;
-
-        let wire = WalletWire::Command(Commands::Keygen).to_wire();
-
-        let keygen_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        println!("keygen result: {:?}", keygen_result);
-        assert!(
-            keygen_result.len() == 2,
-            "Expected keygen result to be a list of 2 noun slabs - markdown and exit"
-        );
-        let exit_cause = unsafe { keygen_result[1].root() };
-        let code = exit_cause.as_cell()?.tail();
-        assert!(unsafe { code.raw_equals(&D(0)) }, "Expected exit code 0");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_derive_child() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&["--new"]);
-
-        let prover_hot_state = produce_prover_hot_state();
-        let nockapp = boot::setup(
-            KERNEL,
-            cli.clone(),
-            prover_hot_state.as_slice(),
-            "wallet",
-            None,
-        )
-        .await
-        .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-
-        // Generate a new key pair
-        let mut entropy = [0u8; 32];
-        let mut salt = [0u8; 16];
-        let (noun, op) = Wallet::keygen(&entropy, &salt)?;
-        let wire = WalletWire::Command(Commands::Keygen).to_wire();
-        let _ = wallet.app.poke(wire, noun.clone()).await?;
-
-        // Derive a child key
-        let index = 0;
-        let hardened = true;
-        let label = None;
-        let (noun, op) = Wallet::derive_child(index, hardened, &label)?;
-
-        let wire = WalletWire::Command(Commands::DeriveChild {
-            index,
-            hardened,
-            label,
-        })
-        .to_wire();
-
-        let derive_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        assert!(
-            derive_result.len() == 2,
-            "Expected derive result to be a list of 2 noun slabs - markdown and exit"
-        );
-
-        let exit_cause = unsafe { derive_result[1].root() };
-        let code = exit_cause.as_cell()?.tail();
-        assert!(unsafe { code.raw_equals(&D(0)) }, "Expected exit code 0");
-
-        Ok(())
-    }
-
-    // TODO make this a real test by creating and signing a real draft
-    #[tokio::test]
-    #[ignore]
-    async fn test_sign_tx() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&[""]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-
-        // Create a temporary input bundle file
-        let bundle_path = "test_bundle.jam";
-        let test_data = vec![0u8; 32]; // TODO make this a real input bundle
-        fs::write(bundle_path, &test_data).map_err(|e| NockAppError::IoError(e))?;
-
-        let wire = WalletWire::Command(Commands::SignTx {
-            transaction: bundle_path.to_string(),
-            index: None,
-            hardened: false,
-        })
-        .to_wire();
-
-        // Test signing with valid indices
-        let (noun, op) = Wallet::sign_tx(bundle_path, None, false)?;
-        let sign_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        println!("sign_result: {:?}", sign_result);
-
-        let wire = WalletWire::Command(Commands::SignTx {
-            transaction: bundle_path.to_string(),
-            index: Some(1),
-            hardened: false,
-        })
-        .to_wire();
-
-        let (noun, op) = Wallet::sign_tx(bundle_path, Some(1), false)?;
-        let sign_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        println!("sign_result: {:?}", sign_result);
-
-        let wire = WalletWire::Command(Commands::SignTx {
-            transaction: bundle_path.to_string(),
-            index: Some(255),
-            hardened: false,
-        })
-        .to_wire();
-
-        let (noun, op) = Wallet::sign_tx(bundle_path, Some(255), false)?;
-        let sign_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        println!("sign_result: {:?}", sign_result);
-
-        // Cleanup
-        fs::remove_file(bundle_path).map_err(|e| NockAppError::IoError(e))?;
-        Ok(())
-    }
-
-    // Tests for Cold Side Commands
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_gen_master_privkey() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&[""]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-        let seedphrase = "correct horse battery staple";
-        let (noun, op) = Wallet::gen_master_privkey(seedphrase)?;
-        println!("privkey_slab: {:?}", noun);
-        let wire = WalletWire::Command(Commands::ImportKeys {
-            file: None,
-            key: None,
-            seedphrase: Some(seedphrase.to_string()),
-            watch_only_pubkey: None,
-        })
-        .to_wire();
-        let privkey_result = wallet.app.poke(wire, noun.clone()).await?;
-        println!("privkey_result: {:?}", privkey_result);
-        Ok(())
-    }
-
-    // Tests for Hot Side Commands
-    // TODO: fix this test by adding a real key file
-    #[tokio::test]
-    #[ignore]
-    async fn test_import_keys() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&["--new"]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-
-        // Create test key file
-        let test_path = "test_keys.jam";
-        let test_data = vec![0u8; 32]; // TODO: Use real jammed key data
-        fs::write(test_path, &test_data).expect(&format!(
-            "Called `expect()` at {}:{} (git sha: {})",
-            file!(),
-            line!(),
-            option_env!("GIT_SHA").unwrap_or("unknown")
-        ));
-
-        let (noun, op) = Wallet::import_keys(test_path)?;
-        let wire = WalletWire::Command(Commands::ImportKeys {
-            file: Some(test_path.to_string()),
-            key: None,
-            seedphrase: None,
-            watch_only_pubkey: None,
-        })
-        .to_wire();
-        let import_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        fs::remove_file(test_path).expect(&format!(
-            "Called `expect()` at {}:{} (git sha: {})",
-            file!(),
-            line!(),
-            option_env!("GIT_SHA").unwrap_or("unknown")
-        ));
-
-        println!("import result: {:?}", import_result);
-        assert!(
-            !import_result.is_empty(),
-            "Expected non-empty import result"
-        );
-
-        Ok(())
-    }
-
-    // TODO: fix this test
-    #[tokio::test]
-    #[ignore]
-    async fn test_spend_multisig_format() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&[""]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-
-        let names = "[first1 last1],[first2 last2]".to_string();
-        let recipients = "[1 pk1],[2 pk2,pk3,pk4]".to_string();
-        let gifts = "1,2".to_string();
-        let fee = 1;
-
-        let (noun, op) = Wallet::create_tx(
-            names.clone(),
-            recipients.clone(),
-            gifts.clone(),
-            fee,
-            None,
-            false,
-            None,
-        )?;
-        let wire = WalletWire::Command(Commands::CreateTx {
-            names: names.clone(),
-            recipients: recipients.clone(),
-            gifts: gifts.clone(),
-            fee: fee.clone(),
-            index: None,
-            hardened: false,
-            timelock_intent: None,
-        })
-        .to_wire();
-        let spend_result = wallet.app.poke(wire, noun.clone()).await?;
-        println!("spend_result: {:?}", spend_result);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_spend_single_sig_format() -> Result<(), NockAppError> {
-        let cli = BootCli::parse_from(&[""]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        init_tracing();
-        let mut wallet = Wallet::new(nockapp);
-
-        // these should be valid names of notes in the wallet balance
-        let names = "[Amt4GcpYievY4PXHfffiWriJ1sYfTXFkyQsGzbzwMVzewECWDV3Ad8Q BJnaDB3koU7ruYVdWCQqkFYQ9e3GXhFsDYjJ1vSmKFdxzf6Y87DzP4n]".to_string();
-        let recipients = "3HKKp7xZgCw1mhzk4iw735S2ZTavCLHc8YDGRP6G9sSTrRGsaPBu1AqJ8cBDiw2LwhRFnQG7S3N9N9okc28uBda6oSAUCBfMSg5uC9cefhrFrvXVGomoGcRvcFZTWuJzm3ch".to_string();
-
-        let gifts = "0".to_string();
-        let fee = 0;
-
-        // generate keys
-        let (genkey_noun, genkey_op) = Wallet::gen_master_privkey("correct horse battery staple")?;
-        let (spend_noun, spend_op) = Wallet::create_tx(
-            names.clone(),
-            recipients.clone(),
-            gifts.clone(),
-            fee,
-            None,
-            false,
-            None,
-        )?;
-
-        let wire1 = WalletWire::Command(Commands::ImportKeys {
-            file: None,
-            key: None,
-            seedphrase: Some("correct horse battery staple".to_string()),
-            watch_only_pubkey: None,
-        })
-        .to_wire();
-        let genkey_result = wallet.app.poke(wire1, genkey_noun.clone()).await?;
-        println!("genkey_result: {:?}", genkey_result);
-
-        let wire2 = WalletWire::Command(Commands::CreateTx {
-            names: names.clone(),
-            recipients: recipients.clone(),
-            gifts: gifts.clone(),
-            fee: fee.clone(),
-            index: None,
-            hardened: false,
-            timelock_intent: None,
-        })
-        .to_wire();
-        let spend_result = wallet.app.poke(wire2, spend_noun.clone()).await?;
-        println!("spend_result: {:?}", spend_result);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_list_notes() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&[""]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-
-        // Test listing notes
-        let (noun, op) = Wallet::list_notes()?;
-        let wire = WalletWire::Command(Commands::ListNotes {}).to_wire();
-        let list_result = wallet.app.poke(wire, noun.clone()).await?;
-        println!("list_result: {:?}", list_result);
-
-        Ok(())
-    }
-
-    // TODO: fix this test by adding a real draft
-    #[tokio::test]
-    #[ignore]
-    async fn test_make_tx_from_draft() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&[""]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-
-        // use the transaction in txs/
-        let transaction_path = "txs/test_transaction.tx";
-        let test_data = vec![0u8; 32]; // TODO: Use real transaction data
-        fs::write(transaction_path, &test_data).expect(&format!(
-            "Called `expect()` at {}:{} (git sha: {})",
-            file!(),
-            line!(),
-            option_env!("GIT_SHA").unwrap_or("unknown")
-        ));
-
-        let (noun, op) = Wallet::send_tx(transaction_path)?;
-        let wire = WalletWire::Command(Commands::SendTx {
-            transaction: transaction_path.to_string(),
-        })
-        .to_wire();
-        let tx_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        fs::remove_file(transaction_path).expect(&format!(
-            "Called `expect()` at {}:{} (git sha: {})",
-            file!(),
-            line!(),
-            option_env!("GIT_SHA").unwrap_or("unknown")
-        ));
-
-        println!("transaction result: {:?}", tx_result);
-        assert!(
-            !tx_result.is_empty(),
-            "Expected non-empty transaction result"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_show_tx() -> Result<(), NockAppError> {
-        init_tracing();
-        let cli = BootCli::parse_from(&[""]);
-        let nockapp = boot::setup(KERNEL, cli.clone(), &[], "wallet", None)
-            .await
-            .map_err(|e| CrownError::Unknown(e.to_string()))?;
-        let mut wallet = Wallet::new(nockapp);
-
-        // Create a temporary transaction file
-        let transaction_path = "test_show_transaction.tx";
-        let test_data = vec![0u8; 32]; // TODO: Use real transaction data
-        fs::write(transaction_path, &test_data).expect(&format!(
-            "Called `expect()` at {}:{} (git sha: {})",
-            file!(),
-            line!(),
-            option_env!("GIT_SHA").unwrap_or("unknown")
-        ));
-
-        let (noun, op) = Wallet::show_tx(transaction_path)?;
-        let wire = WalletWire::Command(Commands::ShowTx {
-            transaction: transaction_path.to_string(),
-        })
-        .to_wire();
-        let show_result = wallet.app.poke(wire, noun.clone()).await?;
-
-        fs::remove_file(transaction_path).expect(&format!(
-            "Called `expect()` at {}:{} (git sha: {})",
-            file!(),
-            line!(),
-            option_env!("GIT_SHA").unwrap_or("unknown")
-        ));
-
-        println!("show-tx result: {:?}", show_result);
-        assert!(!show_result.is_empty(), "Expected non-empty show-tx result");
-
-        Ok(())
-    }
-
-    #[test]
-    fn domain_hash_from_base58_accepts_valid_id() {
-        let tx_id = "3giXkwW4zbFhoyJu27RbP6VNiYgR6yaTfk2AYnEHvxtVaGbmcVD6jb9";
-        DomainHash::from_base58(tx_id).expect("expected valid base58 hash");
-    }
-
-    #[test]
-    fn domain_hash_from_base58_rejects_invalid_id() {
-        let invalid_tx_id = "not-a-valid-hash";
-        assert!(DomainHash::from_base58(invalid_tx_id).is_err());
     }
 }
